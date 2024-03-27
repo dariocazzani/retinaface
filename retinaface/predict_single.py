@@ -1,10 +1,12 @@
-"""There is a lot of post processing of the predictions."""
-from collections import OrderedDict
+"""
+There is a lot of post processing of the predictions.
+"""
 from typing import Dict, List, Union
 
 import albumentations as A
 import numpy as np
 import torch
+from iglovikov_helper_functions.utils.image_utils import pad_to_size, unpad_from_size
 from torch.nn import functional as F
 from torchvision.ops import nms
 
@@ -12,8 +14,6 @@ from retinaface.box_utils import decode, decode_landm
 from retinaface.network import RetinaFace
 from retinaface.prior_box import priorbox
 from retinaface.utils import tensor_from_rgb_image
-
-ROUNDING_DIGITS = 2
 
 
 class Model:
@@ -28,49 +28,49 @@ class Model:
         self.device = device
         self.transform = A.Compose([A.LongestMaxSize(max_size=max_size, p=1), A.Normalize(p=1)])
         self.max_size = max_size
+        self.prior_box = priorbox(
+            min_sizes=[[16, 32], [64, 128], [256, 512]],
+            steps=[8, 16, 32],
+            clip=False,
+            image_size=(self.max_size, self.max_size),
+        ).to(device)
         self.variance = [0.1, 0.2]
 
-    def load_state_dict(self, state_dict: OrderedDict) -> None:
+    def load_state_dict(self, state_dict: Dict[str, torch.Tensor]) -> None:
         self.model.load_state_dict(state_dict)
 
-    def eval(self) -> None:  # noqa: A003
+    def eval(self):
         self.model.eval()
 
     def predict_jsons(
-        self, image: np.ndarray, confidence_threshold: float = 0.7, nms_threshold: float = 0.4
+        self, image: np.array, confidence_threshold: float = 0.7, nms_threshold: float = 0.4
     ) -> List[Dict[str, Union[List, float]]]:
         with torch.no_grad():
             original_height, original_width = image.shape[:2]
 
+            scale_landmarks = torch.from_numpy(np.tile([self.max_size, self.max_size], 5)).to(self.device)
+            scale_bboxes = torch.from_numpy(np.tile([self.max_size, self.max_size], 2)).to(self.device)
+
             transformed_image = self.transform(image=image)["image"]
 
-            transformed_height, transformed_width = transformed_image.shape[:2]
-            transformed_size = (transformed_width, transformed_height)
+            paded = pad_to_size(target_size=(self.max_size, self.max_size), image=transformed_image)
 
-            scale_landmarks = torch.from_numpy(np.tile(transformed_size, 5)).to(self.device)
-            scale_bboxes = torch.from_numpy(np.tile(transformed_size, 2)).to(self.device)
+            pads = paded["pads"]
 
-            prior_box = priorbox(
-                min_sizes=[[16, 32], [64, 128], [256, 512]],
-                steps=[8, 16, 32],
-                clip=False,
-                image_size=transformed_image.shape[:2],
-            ).to(self.device)
+            torched_image = tensor_from_rgb_image(paded["image"]).to(self.device)
 
-            torched_image = tensor_from_rgb_image(transformed_image).to(self.device)
-
-            loc, conf, land = self.model(torched_image.unsqueeze(0))  # pylint: disable=E1102
+            loc, conf, land = self.model(torched_image.unsqueeze(0))
 
             conf = F.softmax(conf, dim=-1)
 
             annotations: List[Dict[str, Union[List, float]]] = []
 
-            boxes = decode(loc.data[0], prior_box, self.variance)
+            boxes = decode(loc.data[0], self.prior_box, self.variance)
 
             boxes *= scale_bboxes
             scores = conf[0][:, 1]
 
-            landmarks = decode_landm(land.data[0], prior_box, self.variance)
+            landmarks = decode_landm(land.data[0], self.prior_box, self.variance)
             landmarks *= scale_landmarks
 
             # ignore low scores
@@ -79,25 +79,34 @@ class Model:
             landmarks = landmarks[valid_index]
             scores = scores[valid_index]
 
+            # Sort from high to low
+            order = scores.argsort(descending=True)
+            boxes = boxes[order]
+            landmarks = landmarks[order]
+            scores = scores[order]
+
             # do NMS
             keep = nms(boxes, scores, nms_threshold)
-            boxes = boxes[keep, :]
+            boxes = boxes[keep, :].int()
 
             if boxes.shape[0] == 0:
                 return [{"bbox": [], "score": -1, "landmarks": []}]
 
             landmarks = landmarks[keep]
 
-            scores = scores[keep].cpu().numpy().astype(float)
+            scores = scores[keep].cpu().numpy().astype(np.float64)
+            boxes = boxes.cpu().numpy()
+            landmarks = landmarks.cpu().numpy()
+            landmarks = landmarks.reshape([-1, 2])
 
-            boxes_np = boxes.cpu().numpy()
-            landmarks_np = landmarks.cpu().numpy()
-            resize_coeff = original_height / transformed_height
+            unpadded = unpad_from_size(pads, bboxes=boxes, keypoints=landmarks)
 
-            boxes_np *= resize_coeff
-            landmarks_np = landmarks_np.reshape(-1, 10) * resize_coeff
+            resize_coeff = max(original_height, original_width) / self.max_size
 
-            for box_id, bbox in enumerate(boxes_np):
+            boxes = (unpadded["bboxes"] * resize_coeff).astype(int)
+            landmarks = (unpadded["keypoints"].reshape(-1, 10) * resize_coeff).astype(int)
+
+            for box_id, bbox in enumerate(boxes):
                 x_min, y_min, x_max, y_max = bbox
 
                 x_min = np.clip(x_min, 0, original_width - 1)
@@ -114,12 +123,121 @@ class Model:
 
                 annotations += [
                     {
-                        "bbox": np.round(bbox.astype(float), ROUNDING_DIGITS).tolist(),
-                        "score": np.round(scores, ROUNDING_DIGITS)[box_id],
-                        "landmarks": np.round(landmarks_np[box_id].astype(float), ROUNDING_DIGITS)
-                        .reshape(-1, 2)
-                        .tolist(),
+                        "bbox": bbox.tolist(),
+                        "score": scores[box_id],
+                        "landmarks": landmarks[box_id].reshape(-1, 2).tolist(),
                     }
                 ]
 
             return annotations
+
+    def predict_batch_jsons(
+        self, images: List[np.array], confidence_threshold: float = 0.7, nms_threshold: float = 0.4
+    ) -> List[List[Dict[str, Union[List, float]]]]:
+        batch_annotations: List[List[Dict[str, Union[List, float]]]] = []
+
+        with torch.no_grad():
+            processed_images = []
+            original_sizes = []
+            scales = []
+            pads_list = []
+
+            for image in images:
+                original_height, original_width = image.shape[:2]
+                original_sizes.append((original_height, original_width))
+
+                scale_landmarks = torch.from_numpy(np.tile([self.max_size, self.max_size], 5)).to(self.device)
+                scale_bboxes = torch.from_numpy(np.tile([self.max_size, self.max_size], 2)).to(self.device)
+                scales.append((scale_landmarks, scale_bboxes))
+
+                transformed_image = self.transform(image=image)["image"]
+                paded = pad_to_size(target_size=(self.max_size, self.max_size), image=transformed_image)
+                pads_list.append(paded["pads"])
+
+                torched_image = tensor_from_rgb_image(paded["image"]).to(self.device)
+                processed_images.append(torched_image)
+
+            batch = torch.stack(processed_images)
+            locs, confs, lands = self.model(batch)
+
+            for i in range(len(images)):
+                loc, conf, land = locs[i], confs[i], lands[i]
+                scale_landmarks, scale_bboxes = scales[i]
+                pads = pads_list[i]
+                original_height, original_width = original_sizes[i]
+
+                # Similar processing as your original method, but for individual images in the batch
+                annotations = self.process_single_image(loc, conf, land, scale_landmarks, scale_bboxes,
+                                                confidence_threshold, nms_threshold, pads,
+                                                original_height, original_width)
+                batch_annotations.append(annotations)
+
+        return batch_annotations
+
+
+    def process_single_image(self, loc, conf, land, scale_landmarks, scale_bboxes,
+                         confidence_threshold, nms_threshold, pads,
+                         original_height, original_width):
+        annotations: List[Dict[str, Union[List, float]]] = []
+
+        conf = F.softmax(conf, dim=-1)
+        boxes = decode(loc, self.prior_box, self.variance)
+        boxes *= scale_bboxes
+        scores = conf[:, 1]
+
+        landmarks = decode_landm(land, self.prior_box, self.variance)
+        landmarks *= scale_landmarks
+
+        # Ignore low scores
+        valid_index = torch.where(scores > confidence_threshold)[0]
+        boxes = boxes[valid_index]
+        landmarks = landmarks[valid_index]
+        scores = scores[valid_index]
+
+        # Sort from high to low
+        order = scores.argsort(descending=True)
+        boxes = boxes[order]
+        landmarks = landmarks[order]
+        scores = scores[order]
+
+        # Do NMS
+        keep = nms(boxes, scores, nms_threshold)
+        boxes = boxes[keep, :].int()
+
+        if boxes.shape[0] == 0:
+            return [{"bbox": [], "score": -1, "landmarks": []}]
+
+        landmarks = landmarks[keep]
+        scores = scores[keep].cpu().numpy().astype(np.float64)
+        boxes = boxes.cpu().numpy()
+        landmarks = landmarks.cpu().numpy()
+        landmarks = landmarks.reshape([-1, 2])
+
+        unpadded = unpad_from_size(pads, bboxes=boxes, keypoints=landmarks)
+        resize_coeff = max(original_height, original_width) / self.max_size
+
+        boxes = (unpadded["bboxes"] * resize_coeff).astype(int)
+        landmarks = (unpadded["keypoints"].reshape(-1, 10) * resize_coeff).astype(int)
+
+        for box_id, bbox in enumerate(boxes):
+            x_min, y_min, x_max, y_max = bbox
+
+            x_min = np.clip(x_min, 0, original_width - 1)
+            x_max = np.clip(x_max, x_min + 1, original_width - 1)
+
+            if x_min >= x_max:
+                continue
+
+            y_min = np.clip(y_min, 0, original_height - 1)
+            y_max = np.clip(y_max, y_min + 1, original_height - 1)
+
+            if y_min >= y_max:
+                continue
+
+            annotations.append({
+                "bbox": bbox.tolist(),
+                "score": scores[box_id],
+                "landmarks": landmarks[box_id].reshape(-1, 2).tolist(),
+            })
+
+        return annotations
